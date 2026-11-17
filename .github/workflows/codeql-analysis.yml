@@ -1,13 +1,7 @@
 name: "CodeQL"
 
 on:
-  push:
-    branches: [ 'jetty-10.[1-9]?[0-9].x', 'jetty-11.[1-9]?[0-9].x', 'jetty-12.[1-9]?[0-9].x' ]
-  pull_request:
-    # The branches below must be a subset of the branches above
-    branches: [ 'jetty-10.[1-9]?[0-9].x', 'jetty-11.[1-9]?[0-9].x', 'jetty-12.[1-9]?[0-9].x' ]
-  schedule:
-    - cron: '22 1 * * 2'
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -1,0 +1,195 @@
+# Sealed build of org.eclipse.jetty:jetty-client.
+# Upstream builds and tests on Jenkins (Jenkinsfile: "mvn clean install" on jdk17/21/25);
+# its only GitHub workflows are CodeQL (-P fast, no tests) and a stale-issue bot.
+# This workflow mirrors the Jenkins "clean install" on GitHub runners, scoped to the
+# jetty-client module (+ its reactor dependencies) and to the modules whose tests cover
+# the paths the security patches touch.
+name: "Seal build"
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite of every leg"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  LC_ALL: C.UTF-8
+  LANG: C.UTF-8
+  MAVEN_OPTS: "-Djava.awt.headless=true -Xmx4G -Xms1G"
+  # .mvn/maven.config enables remote-repository filters whose .mvn/rrf allow-lists ship
+  # empty; CLI properties override them. JUnit parallel class execution is switched off
+  # (serial still runs every test) and a per-test timeout turns a hang into a named failure.
+  COMMON_ARGS: >-
+    -B -e -V -ntp
+    -Daether.remoteRepositoryFilter.groupId=false
+    -Daether.remoteRepositoryFilter.prefixes=false
+    -Djunit.jupiter.execution.parallel.enabled=false
+    -Djunit.jupiter.execution.timeout.default=5m
+    -Dsurefire.rerunFailingTestsCount=5
+    -Dspotbugs.skip=true -Dcheckstyle.skip=true -Denforcer.skip=true -Dlicense.skip=true
+    -Dmaven.javadoc.skip=true -Dgpg.skip=true
+
+jobs:
+  build:
+    name: ${{ matrix.leg }} (JDK ${{ matrix.jdk }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Release leg: published jar MANIFEST says Build-Jdk-Spec 25 (Jenkins release = jdk25).
+          - leg: jetty-client
+            jdk: "25"
+            build: jetty-core/jetty-client
+            test: jetty-core/jetty-client
+            am: ""
+            artifacts: true
+          - leg: jetty-client
+            jdk: "17"
+            build: jetty-core/jetty-client
+            test: jetty-core/jetty-client
+            am: ""
+          # Every reactor dependency of jetty-client except jetty-server (own leg below).
+          - leg: jetty-client-deps
+            jdk: "25"
+            build: jetty-core/jetty-client
+            test: "jetty-core/jetty-client,!jetty-core/jetty-client,!jetty-core/jetty-server"
+            am: "-am"
+          # jetty-server: plain socket reads ignore interrupts, so the JUnit timeout needs its own thread.
+          - leg: jetty-server
+            jdk: "25"
+            build: jetty-core/jetty-server
+            test: jetty-core/jetty-server
+            am: ""
+            extra: "-Djunit.jupiter.execution.timeout.thread.mode.default=SEPARATE_THREAD"
+          # jetty-http2-server / jetty-http3-server have no tests of their own; their suites live here.
+          - leg: http2-http3-tests
+            jdk: "25"
+            build: "jetty-core/jetty-http2/jetty-http2-tests,jetty-core/jetty-http3/jetty-http3-tests"
+            test: "jetty-core/jetty-http2/jetty-http2-tests,jetty-core/jetty-http3/jetty-http3-tests"
+            am: ""
+          - leg: client-transports
+            jdk: "25"
+            build: jetty-core/jetty-tests/jetty-test-client-transports
+            test: jetty-core/jetty-tests/jetty-test-client-transports
+            am: ""
+          - leg: ee10-servlet
+            jdk: "25"
+            build: jetty-ee10/jetty-ee10-servlet
+            test: jetty-ee10/jetty-ee10-servlet
+            am: ""
+          - leg: ee11-servlet
+            jdk: "25"
+            build: jetty-ee11/jetty-ee11-servlet
+            test: jetty-ee11/jetty-ee11-servlet
+            am: ""
+          - leg: ee9-nested
+            jdk: "25"
+            build: jetty-ee9/jetty-ee9-nested
+            test: jetty-ee9/jetty-ee9-nested
+            am: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup JDK ${{ matrix.jdk }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.jdk }}
+
+      - name: Prepare Mimir
+        shell: bash
+        run: |
+          mkdir -p ~/.mimir
+          cp .github/ci-mimir-daemon.properties ~/.mimir/daemon.properties
+
+      - name: Set up Maven
+        run:
+          mvn -e -B -V org.apache.maven.plugins:maven-wrapper-plugin:3.3.2:wrapper "-Dmaven=3.9.14"
+
+      - name: Build reactor dependencies (tests run in the next step)
+        run: |
+          ./mvnw clean install $COMMON_ARGS -pl '${{ matrix.build }}' -am -DskipTests
+
+      - name: Test ${{ matrix.leg }}
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          FILTER_ARGS=""
+          if [ -n "$TEST_FILTER" ]; then
+            FILTER_ARGS="-Dtest=$TEST_FILTER -Dsurefire.failIfNoSpecifiedTests=false -DfailIfNoTests=false"
+          fi
+          ./mvnw install $COMMON_ARGS ${{ matrix.extra }} $FILTER_ARGS -pl '${{ matrix.test }}' ${{ matrix.am }}
+
+      - name: List skipped tests with reasons
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+          # A bare JUnit "Assumption failed" message carries no cause, so look up the
+          # assume*(...) conditions in the test method's source and print them as the reason.
+          _src = {}
+          def assumptions(classname, testname, trace):
+              top = classname.split("$")[0]
+              if top not in _src:
+                  hits = glob.glob("**/src/test/java/" + top.replace(".", "/") + ".java", recursive=True)
+                  _src[top] = open(hits[0], encoding="utf-8").read().splitlines() if hits else []
+              lines = _src[top]
+              # Prefer the exact source line of the failed assumption, from the stack trace.
+              m = re.search(r"\(" + re.escape(top.rsplit(".", 1)[-1]) + r"\.java:(\d+)\)", trace)
+              if m and 0 < int(m.group(1)) <= len(lines):
+                  return lines[int(m.group(1)) - 1].strip()
+              method = testname.split("(")[0].split("[")[0].strip()
+              start = next((i for i, l in enumerate(lines) if re.search(r"\bvoid\s+" + re.escape(method) + r"\s*\(", l)), None)
+              if start is None:
+                  return ""
+              found = []
+              for l in lines[start + 1:start + 120]:
+                  if re.search(r"\bvoid\s+\w+\s*\(", l):
+                      break
+                  if "assume" in l:
+                      found.append(l.strip())
+              return " | ".join(found)
+          total = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          skipped = []
+          for f in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              try:
+                  root = ET.parse(f).getroot()
+              except ET.ParseError:
+                  continue
+              for k in total:
+                  total[k] += int(root.get(k, 0) or 0)
+              for tc in root.iter("testcase"):
+                  s = tc.find("skipped")
+                  if s is not None:
+                      full = (s.get('message') or '') + "\n" + (s.text or '')
+                      msg = (full.strip().splitlines() or ['no message'])[0].strip()
+                      if "assumption is not" in msg or msg == 'no message':
+                          cond = assumptions(tc.get('classname'), tc.get('name'), full)
+                          if cond:
+                              msg = f"REASON: this parameter/environment fails the test's own assumption `{cond}` ({msg})"
+                      skipped.append(f"{tc.get('classname')}#{tc.get('name')}: {msg}")
+          print(f"Surefire totals: tests={total['tests']} failures={total['failures']} errors={total['errors']} skipped={total['skipped']} passed={total['tests']-total['failures']-total['errors']-total['skipped']}")
+          for line in skipped:
+              print("SKIPPED", line)
+          EOF
+
+      - name: Upload jetty-client artifacts
+        if: ${{ matrix.artifacts }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-client-jars
+          if-no-files-found: error
+          path: |
+            jetty-core/jetty-client/target/jetty-client-*[0-9].jar
+            jetty-core/jetty-client/target/jetty-client-*-config.jar
+            jetty-core/jetty-client/target/jetty-client-*-hybrid.jar
